@@ -1,0 +1,29 @@
+.DS_Store
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling and local caches
+.mplconfig/
+.swift_cache/
+.swift_module_cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated experiment outputs
+outputs/data/*.csv
+outputs/plots/*.png
+
+# Optional local config overrides
+config.local.yaml
