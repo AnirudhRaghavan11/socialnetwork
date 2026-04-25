@@ -130,7 +130,7 @@ The pipeline produces:
 - per-condition metrics CSVs
 - per-condition adoption-level CSVs
 - combined metrics/statistics CSVs
-- sensitivity-analysis CSVs
+- sensitivity-analysis CSVs (run on both scale-free and small-world topologies)
 - time-series plots
 - boxplots of metrics
 - cascade-distribution plots
@@ -188,6 +188,8 @@ If you rerun the pipeline with the same `--random-seed` and the same configurati
 - Each run regenerates a fresh graph, so repeated runs are independent realizations of the selected network model.
 - Generated CSVs and plots are not committed by default because they are ignored in `.gitignore`.
 - If you want to keep a specific result set, either remove those ignore rules temporarily or copy the files elsewhere.
+- Condition strings are defined as module-level constants: `COND_OPAQUE`, `COND_PARTIAL`, `COND_FULL`, and `ALL_CONDITIONS`. Use these instead of raw strings if you import from or extend `network.py`.
+- The hop-count sentinel value is defined as `INF_HOP = 10**9`. Use this constant rather than hardcoding large numbers when checking or initializing hop counts.
 
 ## Suggested Workflow
 
