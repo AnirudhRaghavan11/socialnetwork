@@ -31,7 +31,7 @@ os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 DEFAULT_CONFIG = {
     "network_sizes": [500, 1000],
     "runs_per_config": 100,
-    "seed_count": 5,
+    "seed_count": 1,
     "max_timesteps": 200,
     "conditions": ["opaque", "partial", "full"],
     "alpha": 0.1,
@@ -59,10 +59,12 @@ class Agent:
     hop_count: int
     path_diversity: int
     neighbors: list
+    exposure_sources: set
 
     def __post_init__(self):
         self._candidate_hop = self.hop_count
-        self._candidate_path_diversity = 0
+        self._candidate_path_diversity = self.path_diversity
+        self._candidate_exposure_sources = set(self.exposure_sources)
 
     def compute_next_state(
         self,
@@ -70,25 +72,31 @@ class Agent:
         neighbor_states,
         alpha=0.1,
         beta=0.05,
-        skeptic_threshold_bias=0.15,
+        skeptic_threshold_bias=0.05,
         weak_believer_influence=0.4,
     ):
         believer_states = {"source_believer", "strong_believer", "weak_believer"}
+
+        # Once an agent is believing, its adoption metadata are frozen.
         if self.state in believer_states:
             self._candidate_hop = self.hop_count
             self._candidate_path_diversity = self.path_diversity
+            self._candidate_exposure_sources = set(self.exposure_sources)
             return self.state
 
         if not self.neighbors:
             self._candidate_hop = self.hop_count
-            self._candidate_path_diversity = 0
+            self._candidate_path_diversity = self.path_diversity
+            self._candidate_exposure_sources = set(self.exposure_sources)
             return self.state
 
         sharing = [n for n in neighbor_states if n["state"] in believer_states]
 
+        # No current exposure this step: keep existing exposure history.
         if not sharing:
             self._candidate_hop = self.hop_count
-            self._candidate_path_diversity = 0
+            self._candidate_path_diversity = len(self.exposure_sources)
+            self._candidate_exposure_sources = set(self.exposure_sources)
             return self.state
 
         influence = 0.0
@@ -99,9 +107,16 @@ class Agent:
                 influence += 1.0
         fraction = influence / len(self.neighbors)
 
-        min_hop = min(n["hop_count"] for n in sharing if n["hop_count"] < 10**8)
-        self._candidate_hop = min_hop + 1
-        self._candidate_path_diversity = len({n["id"] for n in sharing})
+        sharing_ids = {n["id"] for n in sharing}
+        candidate_exposure_sources = self.exposure_sources.union(sharing_ids)
+        self._candidate_exposure_sources = candidate_exposure_sources
+        self._candidate_path_diversity = len(candidate_exposure_sources)
+
+        finite_hops = [n["hop_count"] for n in sharing if n["hop_count"] < 10**8]
+        if finite_hops:
+            self._candidate_hop = min(finite_hops) + 1
+        else:
+            self._candidate_hop = self.hop_count
 
         state_bias = skeptic_threshold_bias if self.state == "skeptic" else 0.0
 
@@ -120,8 +135,10 @@ class Agent:
             raise ValueError(f"Unknown condition: {condition}")
 
         effective_threshold = max(0.0, min(1.0, effective_threshold))
+
         if fraction > effective_threshold:
             return "strong_believer"
+
         return self.state
 
 
@@ -179,6 +196,7 @@ def initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction=0.5
             hop_count=10**9,
             path_diversity=0,
             neighbors=list(graph.neighbors(node)),
+            exposure_sources=set(),
         )
     return agents
 
@@ -242,16 +260,18 @@ def run_single_simulation(
     threshold_std,
     seed_count=1,
 ):
+    believer_states = {"source_believer", "strong_believer", "weak_believer"}
+
     agents = initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction)
 
-    seeds = random.sample(list(graph.nodes), seed_count)
-    agents[seeds[0]].state = "source_believer"
-    agents[seeds[0]].hop_count = 0
-    agents[seeds[0]].path_diversity = 1
-    for seed in seeds[1:]:
-        agents[seed].state = "strong_believer"
-        agents[seed].hop_count = 0
-        agents[seed].path_diversity = 1
+    if seed_count != 1:
+        raise ValueError("This model requires exactly one true source (seed_count=1).")
+
+    seed = random.choice(list(graph.nodes))
+    agents[seed].state = "source_believer"
+    agents[seed].hop_count = 0
+    agents[seed].path_diversity = 0
+    agents[seed].exposure_sources = set()
 
     logs = []
     history = []
@@ -282,6 +302,7 @@ def run_single_simulation(
         next_states = {}
         next_hops = {}
         next_diversity = {}
+        next_exposure_sources = {}
 
         for agent in agents.values():
             neighbor_states = [
@@ -292,6 +313,7 @@ def run_single_simulation(
                 }
                 for nid in agent.neighbors
             ]
+
             next_state = agent.compute_next_state(
                 condition=condition,
                 neighbor_states=neighbor_states,
@@ -300,15 +322,32 @@ def run_single_simulation(
                 skeptic_threshold_bias=skeptic_threshold_bias,
                 weak_believer_influence=weak_believer_influence,
             )
+
             next_states[agent.id] = next_state
             next_hops[agent.id] = agent._candidate_hop
             next_diversity[agent.id] = agent._candidate_path_diversity
+            next_exposure_sources[agent.id] = set(agent._candidate_exposure_sources)
 
         for agent in agents.values():
-            agent.state = next_states[agent.id]
-            if agent.state in {"source_believer", "strong_believer", "weak_believer"}:
-                agent.hop_count = min(agent.hop_count, next_hops[agent.id])
-                agent.path_diversity = max(agent.path_diversity, next_diversity[agent.id])
+            old_state = agent.state
+            new_state = next_states[agent.id]
+
+            was_believer = old_state in believer_states
+            will_believe = new_state in believer_states
+
+            agent.state = new_state
+
+            # Freeze transparency metadata at first adoption only.
+            if (not was_believer) and will_believe:
+                agent.hop_count = next_hops[agent.id]
+                agent.path_diversity = next_diversity[agent.id]
+                agent.exposure_sources = set(next_exposure_sources[agent.id])
+
+            # If still non-believing, update cumulative exposure history.
+            elif (not was_believer) and (not will_believe):
+                agent.exposure_sources = set(next_exposure_sources[agent.id])
+
+            # If already believing, do not modify hop_count/path_diversity/exposure_sources.
 
         num_weakened = weaken_believers(
             agents,
