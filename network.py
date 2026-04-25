@@ -248,6 +248,37 @@ def weaken_believers(
 
     return num_to_weaken
 
+
+def make_adoption_log_row(
+    run_id,
+    graph_seed,
+    init_seed,
+    network_type,
+    network_size,
+    condition,
+    timestep,
+    node_id,
+    old_state,
+    new_state,
+    hop_count_at_adoption,
+    path_diversity_at_adoption,
+):
+    return {
+        "run_id": run_id,
+        "graph_seed": graph_seed,
+        "init_seed": init_seed,
+        "network_type": network_type,
+        "network_size": network_size,
+        "condition": condition,
+        "timestep": timestep,
+        "node_id": node_id,
+        "old_state": old_state,
+        "new_state": new_state,
+        "hop_count_at_adoption": hop_count_at_adoption,
+        "path_diversity_at_adoption": path_diversity_at_adoption,
+    }
+
+
 def run_single_simulation(
     graph,
     network_type,
@@ -270,8 +301,6 @@ def run_single_simulation(
     init_seed=None,
 ):
     believer_states = {"source_believer", "strong_believer", "weak_believer"}
-    debug_run = (run_id == 0)
-
     rng = random.Random(init_seed)
 
     agents = initialize_agents(
@@ -291,27 +320,9 @@ def run_single_simulation(
     agents[seed].path_diversity = 0
     agents[seed].exposure_sources = set()
 
-    if debug_run:
-        print("DEBUG timestep 0")
-        print("source node:", seed)
-        print("source state:", agents[seed].state)
-        print("source hop_count:", agents[seed].hop_count)
-        print("source path_diversity:", agents[seed].path_diversity)
-
-        skeptic, normal, source, strong, weak, believing = count_states(agents)
-        print({
-            "skeptic": skeptic,
-            "normal": normal,
-            "source_believer": source,
-            "strong_believer": strong,
-            "weak_believer": weak,
-            "believing_total": believing,
-        })
-
     logs = []
     history = []
     last_change_timestep = 0
-    first_adoption_record = {}
     adoption_log = []
 
     skeptic, normal, source, strong, weak, believing = count_states(agents)
@@ -375,16 +386,11 @@ def run_single_simulation(
 
             agent.state = new_state
 
+            # Hop count and path diversity are frozen at first adoption.
             if (not was_believer) and will_believe:
                 agent.hop_count = next_hops[agent.id]
                 agent.path_diversity = next_diversity[agent.id]
                 agent.exposure_sources = set(next_exposure_sources[agent.id])
-
-                if agent.id not in first_adoption_record:
-                    first_adoption_record[agent.id] = (
-                        next_hops[agent.id],
-                        next_diversity[agent.id],
-                    )
 
                 adoption_log.append(
                     make_adoption_log_row(
@@ -403,49 +409,9 @@ def run_single_simulation(
                     )
                 )
 
-                if debug_run:
-                    print(
-                        "ADOPT",
-                        {
-                            "timestep": t,
-                            "node_id": agent.id,
-                            "old_state": old_state,
-                            "new_state": new_state,
-                            "hop_count_at_adoption": next_hops[agent.id],
-                            "path_diversity_at_adoption": next_diversity[agent.id],
-                            "exposure_sources_size": len(next_exposure_sources[agent.id]),
-                        }
-                    )
-
+            # Path diversity is based on cumulative distinct exposure sources before adoption.
             elif (not was_believer) and (not will_believe):
-                old_size = len(agent.exposure_sources)
                 agent.exposure_sources = set(next_exposure_sources[agent.id])
-                new_size = len(agent.exposure_sources)
-
-                if debug_run and new_size > old_size:
-                    print(
-                        "EXPOSURE_ACCUMULATED",
-                        {
-                            "timestep": t,
-                            "node_id": agent.id,
-                            "old_size": old_size,
-                            "new_size": new_size,
-                            "current_exposure_sources": sorted(list(agent.exposure_sources)),
-                        }
-                    )
-
-        if debug_run:
-            for node_id, (first_hop, first_div) in first_adoption_record.items():
-                a = agents[node_id]
-                if a.hop_count != first_hop or a.path_diversity != first_div:
-                    print(
-                        "ERROR: frozen metadata changed",
-                        {
-                            "node_id": node_id,
-                            "expected": (first_hop, first_div),
-                            "actual": (a.hop_count, a.path_diversity),
-                        }
-                    )
 
         num_weakened = weaken_believers(
             agents,
@@ -762,23 +728,26 @@ def append_dict_rows(rows, path):
         writer.writerows(rows)
 
 
-def plot_time_series(histories_by_condition, output_path, title):
+def plot_time_series(histories_by_condition, output_path, title, network_size):
     plt.figure(figsize=(9, 5))
+
     for condition, histories in histories_by_condition.items():
         if not histories:
             continue
+
         num_steps = len(histories[0])
         avg = []
         lower_ci = []
         upper_ci = []
+
         for t in range(num_steps):
             vals = [h[t] for h in histories]
             mean = safe_mean(vals)
-            # Approximate 95% confidence interval around the mean believing curve.
             margin = 1.96 * safe_std(vals) / math.sqrt(len(vals))
-            avg.append(mean)
-            lower_ci.append(max(0.0, mean - margin))
-            upper_ci.append(mean + margin)
+
+            avg.append(mean / network_size)
+            lower_ci.append(max(0.0, (mean - margin) / network_size))
+            upper_ci.append(min(1.0, (mean + margin) / network_size))
 
         x = list(range(num_steps))
         plt.plot(x, avg, label=f"{condition} avg", linewidth=2)
@@ -786,7 +755,7 @@ def plot_time_series(histories_by_condition, output_path, title):
 
     plt.title(title)
     plt.xlabel("Timestep")
-    plt.ylabel("Believing agents")
+    plt.ylabel("Believing fraction")
     plt.legend()
     plt.grid(alpha=0.25)
     plt.tight_layout()
@@ -803,19 +772,25 @@ def plot_metric_boxplots(metrics_rows, network_type, network_size, output_path):
         for m in metrics_rows
         if m["network_type"] == network_type and m["network_size"] == network_size
     ]
+
     fig, axes = plt.subplots(2, 3, figsize=(13, 7))
     axes = axes.flatten()
 
     for idx, metric in enumerate(metric_names):
         data = []
         labels = []
+
         for c in conditions:
             vals = [m[metric] for m in subset if m["condition"] == c and m[metric] is not None]
             if vals:
                 data.append(vals)
                 labels.append(c)
+
         if data:
-            axes[idx].boxplot(data, labels=labels)
+            axes[idx].boxplot(data, tick_labels=labels)
+        else:
+            axes[idx].text(0.5, 0.5, "no data", ha="center", va="center")
+
         axes[idx].set_title(metric)
         axes[idx].grid(alpha=0.2)
 
@@ -920,6 +895,7 @@ def run_pipeline(config, label):
 
     for n in config["network_sizes"]:
         size_config = get_config_for_size(config, n)
+
         for network_type in ["scale_free", "small_world"]:
             histories_by_condition = {}
 
@@ -946,6 +922,7 @@ def run_pipeline(config, label):
                     seed_count=size_config["seed_count"],
                     base_seed=config_seed,
                 )
+
                 all_raw_logs.extend(raw_logs)
                 condition_metrics = compute_metrics_for_experiment(raw_logs, last_change_timesteps)
                 all_metrics.extend(condition_metrics)
@@ -954,16 +931,22 @@ def run_pipeline(config, label):
 
                 runs_path = f"outputs/data/experiment_{condition}_{timestamp}_runs.csv"
                 metrics_path = f"outputs/data/experiment_{condition}_{timestamp}_metrics.csv"
+                adoptions_path = f"outputs/data/experiment_{condition}_{timestamp}_adoptions.csv"
+
                 append_dict_rows(raw_logs, runs_path)
                 append_dict_rows(condition_metrics, metrics_path)
-                adoptions_path = f"outputs/data/experiment_{condition}_{timestamp}_adoptions.csv"
                 append_dict_rows(adoption_logs, adoptions_path)
 
                 config_counter += 1
 
             network_title = f"N={n}, network={network_type}"
             ts_plot = f"outputs/plots/time_series_{network_type}_N{n}_{label}_{timestamp}.png"
-            plot_time_series(histories_by_condition, ts_plot, f"Average believing curve ({network_title})")
+            plot_time_series(
+                histories_by_condition,
+                ts_plot,
+                f"Average believing curve ({network_title})",
+                network_size=n,
+            )
 
             box_plot = f"outputs/plots/boxplot_{network_type}_N{n}_{label}_{timestamp}.png"
             subset_metrics = [
@@ -1001,34 +984,6 @@ def run_pipeline(config, label):
         print("Saved statistical tests:", stats_path)
     print("Saved sensitivity summary:", sens_path)
 
-def make_adoption_log_row(
-    run_id,
-    graph_seed,
-    init_seed,
-    network_type,
-    network_size,
-    condition,
-    timestep,
-    node_id,
-    old_state,
-    new_state,
-    hop_count_at_adoption,
-    path_diversity_at_adoption,
-):
-    return {
-        "run_id": run_id,
-        "graph_seed": graph_seed,
-        "init_seed": init_seed,
-        "network_type": network_type,
-        "network_size": network_size,
-        "condition": condition,
-        "timestep": timestep,
-        "node_id": node_id,
-        "old_state": old_state,
-        "new_state": new_state,
-        "hop_count_at_adoption": hop_count_at_adoption,
-        "path_diversity_at_adoption": path_diversity_at_adoption,
-    }
 
 def apply_quick_mode(config):
     quick = deep_merge(config, {})
@@ -1080,7 +1035,7 @@ if __name__ == "__main__":
     parser.add_argument("--quick", action="store_true", help="Run a faster draft experiment")
     parser.add_argument("--network-sizes", nargs="+", type=int, help="Override network sizes")
     parser.add_argument("--runs-per-config", type=int, help="Override runs per configuration")
-    parser.add_argument("--seed-count", type=int, help="Override number of initial seed nodes")
+    parser.add_argument("--seed-count", type=int, help="Override number of initial believer seeds; main model requires 1")
     parser.add_argument("--max-timesteps", type=int, help="Override max timesteps")
     parser.add_argument("--alpha", type=float, help="Override hop-count transparency strength")
     parser.add_argument("--beta", type=float, help="Override path-diversity transparency strength")
