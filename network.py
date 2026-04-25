@@ -27,13 +27,20 @@ os.makedirs("outputs/plots", exist_ok=True)
 os.makedirs("outputs/data", exist_ok=True)
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
+INF_HOP = 10**9
+
+COND_OPAQUE = "opaque"
+COND_PARTIAL = "partial"
+COND_FULL = "full"
+ALL_CONDITIONS = [COND_OPAQUE, COND_PARTIAL, COND_FULL]
+
 
 DEFAULT_CONFIG = {
     "network_sizes": [500, 1000],
     "runs_per_config": 100,
     "seed_count": 1,
     "max_timesteps": 200,
-    "conditions": ["opaque", "partial", "full"],
+    "conditions": ALL_CONDITIONS,
     "alpha": 0.1,
     "beta": 0.05,
     "random_seed": 12345,
@@ -58,6 +65,8 @@ class Agent:
     threshold: float
     state: str
     hop_count: int
+    # path_diversity must always equal len(exposure_sources). Both are kept
+    # for convenience, but exposure_sources is the authoritative source.
     path_diversity: int
     neighbors: list
     exposure_sources: set
@@ -113,7 +122,7 @@ class Agent:
         self._candidate_exposure_sources = candidate_exposure_sources
         self._candidate_path_diversity = len(candidate_exposure_sources)
 
-        finite_hops = [n["hop_count"] for n in sharing if n["hop_count"] < 10**8]
+        finite_hops = [n["hop_count"] for n in sharing if n["hop_count"] < INF_HOP]
         if finite_hops:
             self._candidate_hop = min(finite_hops) + 1
         else:
@@ -121,11 +130,11 @@ class Agent:
 
         state_bias = skeptic_threshold_bias if self.state == "skeptic" else 0.0
 
-        if condition == "opaque":
+        if condition == COND_OPAQUE:
             effective_threshold = self.threshold + state_bias
-        elif condition == "partial":
+        elif condition == COND_PARTIAL:
             effective_threshold = self.threshold + state_bias + alpha * self._candidate_hop
-        elif condition == "full":
+        elif condition == COND_FULL:
             effective_threshold = (
                 self.threshold
                 + state_bias
@@ -174,7 +183,7 @@ def get_config_for_size(config, network_size):
     return size_config
 
 
-def generate_network(network_type, n, params, seed=None):
+def generate_network(network_type: str, n: int, params: dict, seed: int = None) -> nx.Graph:
     if network_type == "scale_free":
         m = params.get("m", 3)
         return nx.barabasi_albert_graph(n, m, seed=seed)
@@ -185,7 +194,7 @@ def generate_network(network_type, n, params, seed=None):
     raise ValueError(f"Invalid network type: {network_type}")
 
 
-def initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction=0.5, rng=None):
+def initialize_agents(graph: nx.Graph, threshold_mean: float, threshold_std: float, skeptic_fraction: float = 0.5, rng: random.Random = None) -> dict:
     if rng is None:
         rng = random.Random()
 
@@ -197,7 +206,7 @@ def initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction=0.5
             id=node,
             threshold=threshold,
             state=initial_state,
-            hop_count=10**9,
+            hop_count=INF_HOP,
             path_diversity=0,
             neighbors=list(graph.neighbors(node)),
             exposure_sources=set(),
@@ -205,7 +214,7 @@ def initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction=0.5
     return agents
 
 
-def count_states(agents):
+def count_states(agents: dict) -> tuple:
     num_skeptic = sum(1 for a in agents.values() if a.state == "skeptic")
     num_normal = sum(1 for a in agents.values() if a.state == "normal")
     num_source = sum(1 for a in agents.values() if a.state == "source_believer")
@@ -277,6 +286,43 @@ def make_adoption_log_row(
         "hop_count_at_adoption": hop_count_at_adoption,
         "path_diversity_at_adoption": path_diversity_at_adoption,
     }
+
+
+def pad_remaining_timesteps(
+    agents, t, max_timesteps, logs, history, run_id, graph_seed, init_seed,
+    network_size, network_type, condition,
+    weakening_per_step_min, weakening_per_step_max, weak_believer_fraction_cap, rng,
+):
+    """Fill log rows for timesteps after early termination, continuing weakening."""
+    for rest_t in range(t + 1, max_timesteps + 1):
+        num_weakened = weaken_believers(
+            agents,
+            weakening_per_step_min=weakening_per_step_min,
+            weakening_per_step_max=weakening_per_step_max,
+            weak_believer_fraction_cap=weak_believer_fraction_cap,
+            rng=rng,
+        )
+        skeptic, normal, source, strong, weak, believing = count_states(agents)
+        logs.append(
+            {
+                "run_id": run_id,
+                "graph_seed": graph_seed,
+                "init_seed": init_seed,
+                "network_size": network_size,
+                "network_type": network_type,
+                "condition": condition,
+                "timestep": rest_t,
+                "num_new_believing": 0,
+                "num_skeptic": skeptic,
+                "num_normal": normal,
+                "num_source_believer": source,
+                "num_strong_believer": strong,
+                "num_weak_believer": weak,
+                "num_weakened_this_step": num_weakened,
+                "num_believing": believing,
+            }
+        )
+        history.append(believing)
 
 
 def run_single_simulation(
@@ -413,6 +459,9 @@ def run_single_simulation(
             elif (not was_believer) and (not will_believe):
                 agent.exposure_sources = set(next_exposure_sources[agent.id])
 
+        # Weakening runs after the commit phase intentionally: it is a separate
+        # decay process, not part of the synchronous adoption update. Agents made
+        # their adoption decisions based on pre-weakening neighbor states.
         num_weakened = weaken_believers(
             agents,
             weakening_per_step_min=weakening_per_step_min,
@@ -449,51 +498,21 @@ def run_single_simulation(
         history.append(believing)
 
         if new_believing == 0 and t > 5:
-            for rest_t in range(t + 1, max_timesteps + 1):
-                logs.append(
-                    {
-                        "run_id": run_id,
-                        "graph_seed": graph_seed,
-                        "init_seed": init_seed,
-                        "network_size": network_size,
-                        "network_type": network_type,
-                        "condition": condition,
-                        "timestep": rest_t,
-                        "num_new_believing": 0,
-                        "num_skeptic": skeptic,
-                        "num_normal": normal,
-                        "num_source_believer": source,
-                        "num_strong_believer": strong,
-                        "num_weak_believer": weak,
-                        "num_weakened_this_step": 0,
-                        "num_believing": believing,
-                    }
-                )
-                history.append(believing)
+            pad_remaining_timesteps(
+                agents, t, max_timesteps, logs, history, run_id, graph_seed,
+                init_seed, network_size, network_type, condition,
+                weakening_per_step_min, weakening_per_step_max,
+                weak_believer_fraction_cap, rng,
+            )
             break
 
         if believing == len(agents):
-            for rest_t in range(t + 1, max_timesteps + 1):
-                logs.append(
-                    {
-                        "run_id": run_id,
-                        "graph_seed": graph_seed,
-                        "init_seed": init_seed,
-                        "network_size": network_size,
-                        "network_type": network_type,
-                        "condition": condition,
-                        "timestep": rest_t,
-                        "num_new_believing": 0,
-                        "num_skeptic": 0,
-                        "num_normal": 0,
-                        "num_source_believer": 1,
-                        "num_strong_believer": 0,
-                        "num_weak_believer": len(agents) - 1,
-                        "num_weakened_this_step": 0,
-                        "num_believing": len(agents),
-                    }
-                )
-                history.append(len(agents))
+            pad_remaining_timesteps(
+                agents, t, max_timesteps, logs, history, run_id, graph_seed,
+                init_seed, network_size, network_type, condition,
+                weakening_per_step_min, weakening_per_step_max,
+                weak_believer_fraction_cap, rng,
+            )
             break
 
     return logs, history, last_change_timestep, adoption_log
@@ -565,7 +584,7 @@ def run_experiment(
     return raw_logs, histories, last_change_timesteps, adoption_logs
 
 
-def compute_metrics(run_log, last_change_timestep=None):
+def compute_metrics(run_log: list, last_change_timestep: int = None) -> dict:
     if not run_log:
         return {}
 
@@ -628,13 +647,13 @@ def compute_metrics_for_experiment(raw_logs, last_change_timesteps=None):
     return metrics
 
 
-def safe_mean(values):
+def safe_mean(values: list) -> float:
     if not values:
         return math.nan
     return sum(values) / len(values)
 
 
-def safe_std(values):
+def safe_std(values: list) -> float:
     if len(values) < 2:
         return 0.0
     mean = safe_mean(values)
@@ -642,11 +661,11 @@ def safe_std(values):
     return math.sqrt(variance)
 
 
-def mann_whitney_comparisons(metrics_rows, network_type, network_size):
+def mann_whitney_comparisons(metrics_rows: list, network_type: str, network_size: int) -> list:
     if mannwhitneyu is None:
         return []
 
-    pairs = [("opaque", "partial"), ("opaque", "full"), ("partial", "full")]
+    pairs = [(COND_OPAQUE, COND_PARTIAL), (COND_OPAQUE, COND_FULL), (COND_PARTIAL, COND_FULL)]
     metric_names = [
         "t25",
         "t50",
@@ -707,7 +726,7 @@ def mann_whitney_comparisons(metrics_rows, network_type, network_size):
     return comparisons
 
 
-def save_dict_rows(rows, path):
+def save_dict_rows(rows: list, path: str) -> None:
     if not rows:
         return
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -716,7 +735,7 @@ def save_dict_rows(rows, path):
         writer.writerows(rows)
 
 
-def append_dict_rows(rows, path):
+def append_dict_rows(rows: list, path: str) -> None:
     if not rows:
         return
 
@@ -765,7 +784,7 @@ def plot_time_series(histories_by_condition, output_path, title, network_size):
 
 def plot_metric_boxplots(metrics_rows, network_type, network_size, output_path):
     metric_names = ["t25", "t50", "peak_infection_ratio", "final_adoption_ratio", "cascade_size"]
-    conditions = ["opaque", "partial", "full"]
+    conditions = ALL_CONDITIONS
 
     subset = [
         m
@@ -787,7 +806,8 @@ def plot_metric_boxplots(metrics_rows, network_type, network_size, output_path):
                 labels.append(c)
 
         if data:
-            axes[idx].boxplot(data, tick_labels=labels)
+            bp = axes[idx].boxplot(data)
+            axes[idx].set_xticklabels(labels)
         else:
             axes[idx].text(0.5, 0.5, "no data", ha="center", va="center")
 
@@ -802,7 +822,7 @@ def plot_metric_boxplots(metrics_rows, network_type, network_size, output_path):
 
 
 def plot_cascade_distribution(metrics_rows, network_type, network_size, output_path):
-    conditions = ["opaque", "partial", "full"]
+    conditions = ALL_CONDITIONS
     plt.figure(figsize=(9, 5))
     subset = [
         m
@@ -849,7 +869,7 @@ def run_sensitivity_analysis(base_config, network_type="scale_free"):
                 raw_logs, _, last_change_timesteps, _ = run_experiment(
                     network_type=network_type,
                     network_size=network_size,
-                    condition="full",
+                    condition=COND_FULL,
                     network_params=base_config["network_params"][network_type],
                     num_runs=10,
                     max_timesteps=base_config["max_timesteps"],
@@ -972,7 +992,9 @@ def run_pipeline(config, label):
     save_dict_rows(all_stats, stats_path)
     save_dict_rows(all_adoptions, adoptions_path)
 
-    sensitivity_rows = run_sensitivity_analysis(config, network_type="scale_free")
+    sensitivity_rows = []
+    for sens_net_type in ["scale_free", "small_world"]:
+        sensitivity_rows.extend(run_sensitivity_analysis(config, network_type=sens_net_type))
     save_dict_rows(sensitivity_rows, sens_path)
 
     print("Saved raw logs:", raw_path)
