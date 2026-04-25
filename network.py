@@ -248,7 +248,6 @@ def weaken_believers(
 
     return num_to_weaken
 
-
 def run_single_simulation(
     graph,
     network_type,
@@ -313,6 +312,7 @@ def run_single_simulation(
     history = []
     last_change_timestep = 0
     first_adoption_record = {}
+    adoption_log = []
 
     skeptic, normal, source, strong, weak, believing = count_states(agents)
     logs.append(
@@ -385,6 +385,23 @@ def run_single_simulation(
                         next_hops[agent.id],
                         next_diversity[agent.id],
                     )
+
+                adoption_log.append(
+                    make_adoption_log_row(
+                        run_id=run_id,
+                        graph_seed=graph_seed,
+                        init_seed=init_seed,
+                        network_type=network_type,
+                        network_size=network_size,
+                        condition=condition,
+                        timestep=t,
+                        node_id=agent.id,
+                        old_state=old_state,
+                        new_state=new_state,
+                        hop_count_at_adoption=next_hops[agent.id],
+                        path_diversity_at_adoption=next_diversity[agent.id],
+                    )
+                )
 
                 if debug_run:
                     print(
@@ -513,7 +530,7 @@ def run_single_simulation(
                 history.append(len(agents))
             break
 
-    return logs, history, last_change_timestep
+    return logs, history, last_change_timestep, adoption_log
 
 
 def run_experiment(
@@ -539,7 +556,8 @@ def run_experiment(
     raw_logs = []
     histories = []
     last_change_timesteps = {}
-
+    adoption_logs = []
+    
     for run_id in range(num_runs):
         graph_seed = base_seed + 100_000 + run_id
         init_seed = base_seed + 200_000 + run_id
@@ -551,7 +569,7 @@ def run_experiment(
             seed=graph_seed,
         )
 
-        run_log, history, last_change_timestep = run_single_simulation(
+        run_log, history, last_change_timestep, run_adoptions = run_single_simulation(
             graph=graph,
             network_type=network_type,
             network_size=network_size,
@@ -576,8 +594,9 @@ def run_experiment(
         raw_logs.extend(run_log)
         histories.append(history)
         last_change_timesteps[run_id] = last_change_timestep
+        adoption_logs.extend(run_adoptions)
 
-    return raw_logs, histories, last_change_timesteps
+    return raw_logs, histories, last_change_timesteps, adoption_logs
 
 
 def compute_metrics(run_log, last_change_timestep=None):
@@ -852,7 +871,7 @@ def run_sensitivity_analysis(base_config, network_type="scale_free"):
             for t_mean in threshold_means:
                 combo_seed = base_seed + combo_idx * 1_000_000
 
-                raw_logs, _, last_change_timesteps = run_experiment(
+                raw_logs, _, last_change_timesteps, _ = run_experiment(
                     network_type=network_type,
                     network_size=network_size,
                     condition="full",
@@ -894,6 +913,7 @@ def run_pipeline(config, label):
     all_raw_logs = []
     all_metrics = []
     all_stats = []
+    all_adoptions = []
 
     master_seed = config.get("random_seed", 12345)
     config_counter = 0
@@ -906,7 +926,7 @@ def run_pipeline(config, label):
             for condition in config["conditions"]:
                 config_seed = master_seed + config_counter * 1_000_000
 
-                raw_logs, histories, last_change_timesteps = run_experiment(
+                raw_logs, histories, last_change_timesteps, adoption_logs = run_experiment(
                     network_type=network_type,
                     network_size=n,
                     condition=condition,
@@ -930,11 +950,14 @@ def run_pipeline(config, label):
                 condition_metrics = compute_metrics_for_experiment(raw_logs, last_change_timesteps)
                 all_metrics.extend(condition_metrics)
                 histories_by_condition[condition] = histories
+                all_adoptions.extend(adoption_logs)
 
                 runs_path = f"outputs/data/experiment_{condition}_{timestamp}_runs.csv"
                 metrics_path = f"outputs/data/experiment_{condition}_{timestamp}_metrics.csv"
                 append_dict_rows(raw_logs, runs_path)
                 append_dict_rows(condition_metrics, metrics_path)
+                adoptions_path = f"outputs/data/experiment_{condition}_{timestamp}_adoptions.csv"
+                append_dict_rows(adoption_logs, adoptions_path)
 
                 config_counter += 1
 
@@ -959,22 +982,53 @@ def run_pipeline(config, label):
     metrics_path = f"outputs/data/metrics_results_{label}_{timestamp}.csv"
     stats_path = f"outputs/data/statistics_{label}_{timestamp}.csv"
     sens_path = f"outputs/data/sensitivity_{label}_{timestamp}.csv"
+    adoptions_path = f"outputs/data/adoptions_{label}_{timestamp}.csv"
 
     save_dict_rows(all_raw_logs, raw_path)
     save_dict_rows(all_metrics, metrics_path)
     save_dict_rows(all_stats, stats_path)
+    save_dict_rows(all_adoptions, adoptions_path)
 
     sensitivity_rows = run_sensitivity_analysis(config, network_type="scale_free")
     save_dict_rows(sensitivity_rows, sens_path)
 
     print("Saved raw logs:", raw_path)
     print("Saved metrics:", metrics_path)
+    print("Saved adoptions:", adoptions_path)
     if mannwhitneyu is None:
         print("SciPy not installed; skipped Mann-Whitney tests.")
     else:
         print("Saved statistical tests:", stats_path)
     print("Saved sensitivity summary:", sens_path)
 
+def make_adoption_log_row(
+    run_id,
+    graph_seed,
+    init_seed,
+    network_type,
+    network_size,
+    condition,
+    timestep,
+    node_id,
+    old_state,
+    new_state,
+    hop_count_at_adoption,
+    path_diversity_at_adoption,
+):
+    return {
+        "run_id": run_id,
+        "graph_seed": graph_seed,
+        "init_seed": init_seed,
+        "network_type": network_type,
+        "network_size": network_size,
+        "condition": condition,
+        "timestep": timestep,
+        "node_id": node_id,
+        "old_state": old_state,
+        "new_state": new_state,
+        "hop_count_at_adoption": hop_count_at_adoption,
+        "path_diversity_at_adoption": path_diversity_at_adoption,
+    }
 
 def apply_quick_mode(config):
     quick = deep_merge(config, {})
