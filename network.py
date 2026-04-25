@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "conditions": ["opaque", "partial", "full"],
     "alpha": 0.1,
     "beta": 0.05,
+    "random_seed": 12345,
     "skeptic_fraction": 0.5,
     "skeptic_threshold_bias": 0.05,
     "weak_believer_influence": 0.4,
@@ -173,22 +174,25 @@ def get_config_for_size(config, network_size):
     return size_config
 
 
-def generate_network(network_type, n, params):
+def generate_network(network_type, n, params, seed=None):
     if network_type == "scale_free":
         m = params.get("m", 3)
-        return nx.barabasi_albert_graph(n, m)
+        return nx.barabasi_albert_graph(n, m, seed=seed)
     if network_type == "small_world":
         k = params.get("k", 6)
         p = params.get("p", 0.3)
-        return nx.watts_strogatz_graph(n, k, p)
+        return nx.watts_strogatz_graph(n, k, p, seed=seed)
     raise ValueError(f"Invalid network type: {network_type}")
 
 
-def initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction=0.5):
+def initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction=0.5, rng=None):
+    if rng is None:
+        rng = random.Random()
+
     agents = {}
     for node in graph.nodes:
-        threshold = max(0.0, min(1.0, random.gauss(threshold_mean, threshold_std)))
-        initial_state = "skeptic" if random.random() < skeptic_fraction else "normal"
+        threshold = max(0.0, min(1.0, rng.gauss(threshold_mean, threshold_std)))
+        initial_state = "skeptic" if rng.random() < skeptic_fraction else "normal"
         agents[node] = Agent(
             id=node,
             threshold=threshold,
@@ -216,7 +220,11 @@ def weaken_believers(
     weakening_per_step_min=1,
     weakening_per_step_max=3,
     weak_believer_fraction_cap=0.3,
+    rng=None,
 ):
+    if rng is None:
+        rng = random.Random()
+
     strong_believers = [agent for agent in agents.values() if agent.state == "strong_believer"]
     weak_believers = [agent for agent in agents.values() if agent.state == "weak_believer"]
     source_believers = [agent for agent in agents.values() if agent.state == "source_believer"]
@@ -230,12 +238,12 @@ def weaken_believers(
     if remaining_slots <= 0:
         return 0
 
-    num_to_weaken = random.randint(weakening_per_step_min, weakening_per_step_max)
+    num_to_weaken = rng.randint(weakening_per_step_min, weakening_per_step_max)
     num_to_weaken = min(num_to_weaken, remaining_slots, len(strong_believers))
     if num_to_weaken <= 0:
         return 0
 
-    for agent in random.sample(strong_believers, num_to_weaken):
+    for agent in rng.sample(strong_believers, num_to_weaken):
         agent.state = "weak_believer"
 
     return num_to_weaken
@@ -259,29 +267,59 @@ def run_single_simulation(
     threshold_mean,
     threshold_std,
     seed_count=1,
+    graph_seed=None,
+    init_seed=None,
 ):
     believer_states = {"source_believer", "strong_believer", "weak_believer"}
+    debug_run = (run_id == 0)
 
-    agents = initialize_agents(graph, threshold_mean, threshold_std, skeptic_fraction)
+    rng = random.Random(init_seed)
+
+    agents = initialize_agents(
+        graph,
+        threshold_mean,
+        threshold_std,
+        skeptic_fraction,
+        rng=rng,
+    )
 
     if seed_count != 1:
-        raise ValueError("This model requires exactly one true source (seed_count=1).")
+        raise ValueError("This revised model requires exactly one true source (seed_count=1).")
 
-    seed = random.choice(list(graph.nodes))
+    seed = rng.choice(list(graph.nodes))
     agents[seed].state = "source_believer"
     agents[seed].hop_count = 0
     agents[seed].path_diversity = 0
     agents[seed].exposure_sources = set()
 
+    if debug_run:
+        print("DEBUG timestep 0")
+        print("source node:", seed)
+        print("source state:", agents[seed].state)
+        print("source hop_count:", agents[seed].hop_count)
+        print("source path_diversity:", agents[seed].path_diversity)
+
+        skeptic, normal, source, strong, weak, believing = count_states(agents)
+        print({
+            "skeptic": skeptic,
+            "normal": normal,
+            "source_believer": source,
+            "strong_believer": strong,
+            "weak_believer": weak,
+            "believing_total": believing,
+        })
+
     logs = []
     history = []
     last_change_timestep = 0
+    first_adoption_record = {}
 
-    # Log timestep 0 after seeding.
     skeptic, normal, source, strong, weak, believing = count_states(agents)
     logs.append(
         {
             "run_id": run_id,
+            "graph_seed": graph_seed,
+            "init_seed": init_seed,
             "network_size": network_size,
             "network_type": network_type,
             "condition": condition,
@@ -337,23 +375,67 @@ def run_single_simulation(
 
             agent.state = new_state
 
-            # Freeze transparency metadata at first adoption only.
             if (not was_believer) and will_believe:
                 agent.hop_count = next_hops[agent.id]
                 agent.path_diversity = next_diversity[agent.id]
                 agent.exposure_sources = set(next_exposure_sources[agent.id])
 
-            # If still non-believing, update cumulative exposure history.
-            elif (not was_believer) and (not will_believe):
-                agent.exposure_sources = set(next_exposure_sources[agent.id])
+                if agent.id not in first_adoption_record:
+                    first_adoption_record[agent.id] = (
+                        next_hops[agent.id],
+                        next_diversity[agent.id],
+                    )
 
-            # If already believing, do not modify hop_count/path_diversity/exposure_sources.
+                if debug_run:
+                    print(
+                        "ADOPT",
+                        {
+                            "timestep": t,
+                            "node_id": agent.id,
+                            "old_state": old_state,
+                            "new_state": new_state,
+                            "hop_count_at_adoption": next_hops[agent.id],
+                            "path_diversity_at_adoption": next_diversity[agent.id],
+                            "exposure_sources_size": len(next_exposure_sources[agent.id]),
+                        }
+                    )
+
+            elif (not was_believer) and (not will_believe):
+                old_size = len(agent.exposure_sources)
+                agent.exposure_sources = set(next_exposure_sources[agent.id])
+                new_size = len(agent.exposure_sources)
+
+                if debug_run and new_size > old_size:
+                    print(
+                        "EXPOSURE_ACCUMULATED",
+                        {
+                            "timestep": t,
+                            "node_id": agent.id,
+                            "old_size": old_size,
+                            "new_size": new_size,
+                            "current_exposure_sources": sorted(list(agent.exposure_sources)),
+                        }
+                    )
+
+        if debug_run:
+            for node_id, (first_hop, first_div) in first_adoption_record.items():
+                a = agents[node_id]
+                if a.hop_count != first_hop or a.path_diversity != first_div:
+                    print(
+                        "ERROR: frozen metadata changed",
+                        {
+                            "node_id": node_id,
+                            "expected": (first_hop, first_div),
+                            "actual": (a.hop_count, a.path_diversity),
+                        }
+                    )
 
         num_weakened = weaken_believers(
             agents,
             weakening_per_step_min=weakening_per_step_min,
             weakening_per_step_max=weakening_per_step_max,
             weak_believer_fraction_cap=weak_believer_fraction_cap,
+            rng=rng,
         )
 
         previous_believing = history[-1]
@@ -365,6 +447,8 @@ def run_single_simulation(
         logs.append(
             {
                 "run_id": run_id,
+                "graph_seed": graph_seed,
+                "init_seed": init_seed,
                 "network_size": network_size,
                 "network_type": network_type,
                 "condition": condition,
@@ -382,11 +466,12 @@ def run_single_simulation(
         history.append(believing)
 
         if new_believing == 0 and t > 5:
-            # Allow a few warm-up timesteps before declaring the cascade stable.
             for rest_t in range(t + 1, max_timesteps + 1):
                 logs.append(
                     {
                         "run_id": run_id,
+                        "graph_seed": graph_seed,
+                        "init_seed": init_seed,
                         "network_size": network_size,
                         "network_type": network_type,
                         "condition": condition,
@@ -405,11 +490,12 @@ def run_single_simulation(
             break
 
         if believing == len(agents):
-            # Keep output length consistent across runs by padding with terminal state.
             for rest_t in range(t + 1, max_timesteps + 1):
                 logs.append(
                     {
                         "run_id": run_id,
+                        "graph_seed": graph_seed,
+                        "init_seed": init_seed,
                         "network_size": network_size,
                         "network_type": network_type,
                         "condition": condition,
@@ -448,12 +534,23 @@ def run_experiment(
     threshold_mean=0.25,
     threshold_std=0.1,
     seed_count=1,
+    base_seed=0,
 ):
     raw_logs = []
     histories = []
     last_change_timesteps = {}
+
     for run_id in range(num_runs):
-        graph = generate_network(network_type, network_size, network_params)
+        graph_seed = base_seed + 100_000 + run_id
+        init_seed = base_seed + 200_000 + run_id
+
+        graph = generate_network(
+            network_type,
+            network_size,
+            network_params,
+            seed=graph_seed,
+        )
+
         run_log, history, last_change_timestep = run_single_simulation(
             graph=graph,
             network_type=network_type,
@@ -472,10 +569,14 @@ def run_experiment(
             threshold_mean=threshold_mean,
             threshold_std=threshold_std,
             seed_count=seed_count,
+            graph_seed=graph_seed,
+            init_seed=init_seed,
         )
+
         raw_logs.extend(run_log)
         histories.append(history)
         last_change_timesteps[run_id] = last_change_timestep
+
     return raw_logs, histories, last_change_timesteps
 
 
@@ -501,6 +602,8 @@ def compute_metrics(run_log, last_change_timestep=None):
 
     return {
         "run_id": run_log[0]["run_id"],
+        "graph_seed": run_log[0].get("graph_seed"),
+        "init_seed": run_log[0].get("init_seed"),
         "network_size": run_log[0]["network_size"],
         "network_type": run_log[0]["network_type"],
         "condition": run_log[0]["condition"],
@@ -741,16 +844,14 @@ def run_sensitivity_analysis(base_config, network_type="scale_free"):
     output = []
 
     network_size = base_config["network_sizes"][0]
-
-    graph = generate_network(
-        network_type,
-        n=network_size,
-        params=base_config["network_params"][network_type],
-    )
+    base_seed = base_config.get("random_seed", 12345)
+    combo_idx = 0
 
     for alpha in alpha_values:
         for beta in beta_values:
             for t_mean in threshold_means:
+                combo_seed = base_seed + combo_idx * 1_000_000
+
                 raw_logs, _, last_change_timesteps = run_experiment(
                     network_type=network_type,
                     network_size=network_size,
@@ -769,6 +870,7 @@ def run_sensitivity_analysis(base_config, network_type="scale_free"):
                     threshold_mean=t_mean,
                     threshold_std=base_config["threshold_distribution"]["std"],
                     seed_count=base_config["seed_count"],
+                    base_seed=combo_seed,
                 )
                 metrics_rows = compute_metrics_for_experiment(raw_logs, last_change_timesteps)
                 final_ratios = [m["final_adoption_ratio"] for m in metrics_rows]
@@ -782,6 +884,7 @@ def run_sensitivity_analysis(base_config, network_type="scale_free"):
                         "avg_final_adoption_ratio": safe_mean(final_ratios),
                     }
                 )
+                combo_idx += 1
 
     return output
 
@@ -792,18 +895,17 @@ def run_pipeline(config, label):
     all_metrics = []
     all_stats = []
 
+    master_seed = config.get("random_seed", 12345)
+    config_counter = 0
+
     for n in config["network_sizes"]:
         size_config = get_config_for_size(config, n)
         for network_type in ["scale_free", "small_world"]:
-            graph = generate_network(
-                network_type=network_type,
-                n=n,
-                params=size_config["network_params"][network_type],
-            )
-
             histories_by_condition = {}
 
             for condition in config["conditions"]:
+                config_seed = master_seed + config_counter * 1_000_000
+
                 raw_logs, histories, last_change_timesteps = run_experiment(
                     network_type=network_type,
                     network_size=n,
@@ -822,17 +924,19 @@ def run_pipeline(config, label):
                     threshold_mean=size_config["threshold_distribution"]["mean"],
                     threshold_std=size_config["threshold_distribution"]["std"],
                     seed_count=size_config["seed_count"],
+                    base_seed=config_seed,
                 )
                 all_raw_logs.extend(raw_logs)
                 condition_metrics = compute_metrics_for_experiment(raw_logs, last_change_timesteps)
                 all_metrics.extend(condition_metrics)
                 histories_by_condition[condition] = histories
 
-                # Save condition-level outputs incrementally so partial progress is not lost.
                 runs_path = f"outputs/data/experiment_{condition}_{timestamp}_runs.csv"
                 metrics_path = f"outputs/data/experiment_{condition}_{timestamp}_metrics.csv"
                 append_dict_rows(raw_logs, runs_path)
                 append_dict_rows(condition_metrics, metrics_path)
+
+                config_counter += 1
 
             network_title = f"N={n}, network={network_type}"
             ts_plot = f"outputs/plots/time_series_{network_type}_N{n}_{label}_{timestamp}.png"
@@ -882,6 +986,8 @@ def apply_quick_mode(config):
 
 def apply_cli_overrides(config, args):
     updated = deep_merge(config, {})
+    if args.random_seed is not None:
+        updated["random_seed"] = args.random_seed
     if args.network_sizes:
         updated["network_sizes"] = args.network_sizes
     if args.runs_per_config is not None:
@@ -915,6 +1021,7 @@ def apply_cli_overrides(config, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Misinformation transparency simulation pipeline")
+    parser.add_argument("--random-seed", type=int, help="Override master random seed")
     parser.add_argument("--config", default="config.yaml", help="Path to config yaml file")
     parser.add_argument("--quick", action="store_true", help="Run a faster draft experiment")
     parser.add_argument("--network-sizes", nargs="+", type=int, help="Override network sizes")
