@@ -851,6 +851,189 @@ def plot_cascade_distribution(metrics_rows, network_type, network_size, output_p
     plt.close()
 
 
+def plot_hop_count_distribution(
+    adoption_logs: list, network_type: str, network_size: int, output_path: str
+) -> None:
+    """Histogram of hop counts at adoption, by condition."""
+    subset = [
+        a for a in adoption_logs
+        if a["network_type"] == network_type and a["network_size"] == network_size
+    ]
+    if not subset:
+        return
+
+    fig, axes = plt.subplots(1, len(ALL_CONDITIONS), figsize=(5 * len(ALL_CONDITIONS), 4),
+                             sharey=True)
+    if len(ALL_CONDITIONS) == 1:
+        axes = [axes]
+
+    for ax, cond in zip(axes, ALL_CONDITIONS):
+        vals = [a["hop_count_at_adoption"] for a in subset
+                if a["condition"] == cond and a["hop_count_at_adoption"] < INF_HOP]
+        if vals:
+            max_hop = max(vals)
+            bins = list(range(0, max_hop + 2))
+            ax.hist(vals, bins=bins, edgecolor="black", alpha=0.7)
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(cond)
+        ax.set_xlabel("Hop count at adoption")
+        ax.grid(alpha=0.2)
+
+    axes[0].set_ylabel("Number of agents")
+    fig.suptitle(f"Hop count at adoption ({network_type}, N={network_size})", y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_path_diversity_distribution(
+    adoption_logs: list, network_type: str, network_size: int, output_path: str
+) -> None:
+    """Histogram of path diversity at adoption, by condition."""
+    subset = [
+        a for a in adoption_logs
+        if a["network_type"] == network_type and a["network_size"] == network_size
+    ]
+    if not subset:
+        return
+
+    fig, axes = plt.subplots(1, len(ALL_CONDITIONS), figsize=(5 * len(ALL_CONDITIONS), 4),
+                             sharey=True)
+    if len(ALL_CONDITIONS) == 1:
+        axes = [axes]
+
+    for ax, cond in zip(axes, ALL_CONDITIONS):
+        vals = [a["path_diversity_at_adoption"] for a in subset if a["condition"] == cond]
+        if vals:
+            max_pd = max(vals)
+            bins = list(range(0, max_pd + 2))
+            ax.hist(vals, bins=bins, edgecolor="black", alpha=0.7)
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(cond)
+        ax.set_xlabel("Path diversity at adoption")
+        ax.grid(alpha=0.2)
+
+    axes[0].set_ylabel("Number of agents")
+    fig.suptitle(f"Path diversity at adoption ({network_type}, N={network_size})", y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_topology_comparison(
+    all_metrics: list, network_size: int, output_path: str
+) -> None:
+    """Side-by-side boxplots comparing scale-free vs small-world for each condition."""
+    metric_names = ["t25", "t50", "peak_infection_ratio", "final_adoption_ratio", "cascade_size"]
+    network_types = ["scale_free", "small_world"]
+
+    subset = [m for m in all_metrics if m["network_size"] == network_size]
+    if not subset:
+        return
+
+    fig, axes = plt.subplots(len(metric_names), 1, figsize=(10, 4 * len(metric_names)))
+    if len(metric_names) == 1:
+        axes = [axes]
+
+    for ax, metric in zip(axes, metric_names):
+        data = []
+        labels = []
+        for cond in ALL_CONDITIONS:
+            for nt in network_types:
+                vals = [
+                    m[metric] for m in subset
+                    if m["condition"] == cond and m["network_type"] == nt
+                    and m[metric] is not None
+                ]
+                if vals:
+                    data.append(vals)
+                    nt_short = "SF" if nt == "scale_free" else "SW"
+                    labels.append(f"{cond}\n{nt_short}")
+
+        if data:
+            bp = ax.boxplot(data, patch_artist=True)
+            ax.set_xticklabels(labels, fontsize=8)
+            # Alternate colors for topology distinction.
+            colors = []
+            for cond in ALL_CONDITIONS:
+                for nt in network_types:
+                    colors.append("#a6cee3" if nt == "scale_free" else "#fdbf6f")
+            for patch, color in zip(bp["boxes"], colors[:len(bp["boxes"])]):
+                patch.set_facecolor(color)
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+
+        ax.set_title(metric)
+        ax.grid(alpha=0.2)
+
+    fig.suptitle(f"Topology comparison (N={network_size}): blue=scale-free, orange=small-world",
+                 y=1.01)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_sensitivity_heatmap(
+    sensitivity_rows: list, output_path: str
+) -> None:
+    """Heatmap of final adoption ratio over alpha x beta, one subplot per (network_type, threshold_mean)."""
+    if not sensitivity_rows:
+        return
+
+    network_types = sorted(set(r["network_type"] for r in sensitivity_rows))
+    threshold_means = sorted(set(r["threshold_mean"] for r in sensitivity_rows))
+    alpha_values = sorted(set(r["alpha"] for r in sensitivity_rows))
+    beta_values = sorted(set(r["beta"] for r in sensitivity_rows))
+
+    n_cols = len(threshold_means)
+    n_rows = len(network_types)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows), squeeze=False)
+
+    for row_idx, nt in enumerate(network_types):
+        for col_idx, t_mean in enumerate(threshold_means):
+            ax = axes[row_idx][col_idx]
+            grid = []
+            for alpha in alpha_values:
+                row_vals = []
+                for beta in beta_values:
+                    match = [
+                        r for r in sensitivity_rows
+                        if r["network_type"] == nt
+                        and abs(r["alpha"] - alpha) < 1e-9
+                        and abs(r["beta"] - beta) < 1e-9
+                        and abs(r["threshold_mean"] - t_mean) < 1e-9
+                    ]
+                    if match:
+                        row_vals.append(match[0]["avg_final_adoption_ratio"])
+                    else:
+                        row_vals.append(math.nan)
+                grid.append(row_vals)
+
+            im = ax.imshow(grid, aspect="auto", origin="lower", vmin=0.0, vmax=1.0, cmap="YlOrRd")
+            ax.set_xticks(range(len(beta_values)))
+            ax.set_xticklabels([f"{b}" for b in beta_values], fontsize=7)
+            ax.set_yticks(range(len(alpha_values)))
+            ax.set_yticklabels([f"{a}" for a in alpha_values], fontsize=7)
+            ax.set_xlabel("beta")
+            ax.set_ylabel("alpha")
+            ax.set_title(f"{nt}, thresh={t_mean}", fontsize=9)
+
+            # Annotate cells with values.
+            for i in range(len(alpha_values)):
+                for j in range(len(beta_values)):
+                    val = grid[i][j]
+                    if not math.isnan(val):
+                        ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=7)
+
+    fig.suptitle("Sensitivity: avg final adoption ratio (full condition)", y=1.02)
+    fig.tight_layout()
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label="Avg final adoption ratio")
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run_sensitivity_analysis(base_config, network_type="scale_free"):
     alpha_values = [0.05, 0.1, 0.15]
     beta_values = [0.02, 0.05, 0.1]
@@ -979,7 +1162,16 @@ def run_pipeline(config, label):
             casc_plot = f"outputs/plots/cascade_{network_type}_N{n}_{label}_{timestamp}.png"
             plot_cascade_distribution(subset_metrics, network_type, n, casc_plot)
 
+            hop_plot = f"outputs/plots/hop_count_{network_type}_N{n}_{label}_{timestamp}.png"
+            plot_hop_count_distribution(all_adoptions, network_type, n, hop_plot)
+
+            pd_plot = f"outputs/plots/path_diversity_{network_type}_N{n}_{label}_{timestamp}.png"
+            plot_path_diversity_distribution(all_adoptions, network_type, n, pd_plot)
+
             all_stats.extend(mann_whitney_comparisons(all_metrics, network_type, n))
+
+        topo_plot = f"outputs/plots/topology_comparison_N{n}_{label}_{timestamp}.png"
+        plot_topology_comparison(all_metrics, n, topo_plot)
 
     raw_path = f"outputs/data/simulation_logs_{label}_{timestamp}.csv"
     metrics_path = f"outputs/data/metrics_results_{label}_{timestamp}.csv"
@@ -996,6 +1188,9 @@ def run_pipeline(config, label):
     for sens_net_type in ["scale_free", "small_world"]:
         sensitivity_rows.extend(run_sensitivity_analysis(config, network_type=sens_net_type))
     save_dict_rows(sensitivity_rows, sens_path)
+
+    sens_plot = f"outputs/plots/sensitivity_heatmap_{label}_{timestamp}.png"
+    plot_sensitivity_heatmap(sensitivity_rows, sens_plot)
 
     print("Saved raw logs:", raw_path)
     print("Saved metrics:", metrics_path)
